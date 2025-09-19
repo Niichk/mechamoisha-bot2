@@ -284,19 +284,19 @@ async def build_reply_for_comment(user_text: str) -> str:
     safety = [
         genai.types.SafetySetting(
             category=genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+            threshold=genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH
         ),
         genai.types.SafetySetting(
             category=genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+            threshold=genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH
         ),
         genai.types.SafetySetting(
             category=genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+            threshold=genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH
         ),
         genai.types.SafetySetting(
             category=genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+            threshold=genai.types.HarmBlockThreshold.BLOCK_ONLY_HIGH
         ),
     ]
 
