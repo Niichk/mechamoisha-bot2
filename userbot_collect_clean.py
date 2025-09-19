@@ -13,6 +13,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, FileReferenceExpired, RPCError, Unauthorized, AuthKeyUnregistered
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
+from pyrogram.raw.types import UpdateNewChannelMessage 
 
 
 # ===== Gemini: новый SDK =====
@@ -44,10 +45,19 @@ def dbg_reply(msg: str):
     if DEBUG_REPLY:
         print(msg)
 
+
+def _channel_to_chat_id(channel_id: int) -> int:
+    # Telegram raw channel_id -> привычный chat_id (-100xxxxxxxxxx)
+    return int(f"-100{channel_id}")
+
+RAW_REPLY = True
+
 # >>> ИСТОЧНИКИ И ЦЕЛЬ <<<
 SOURCE_CHATS = [
-    -1001423363475, -1001304740791, -1001628148774, -1002092838245, -1001096054832,
-    -1001334218632, -1001431200947, -1001268741369, -1001647745905, -1001980097656, -1001544919663
+    _channel_to_chat_id(1423363475), _channel_to_chat_id(1304740791), _channel_to_chat_id(1628148774),
+    _channel_to_chat_id(2092838245), _channel_to_chat_id(1096054832), _channel_to_chat_id(1334218632),
+    _channel_to_chat_id(1431200947), _channel_to_chat_id(1268741369), _channel_to_chat_id(1647745905),
+    _channel_to_chat_id(1980097656), _channel_to_chat_id(1544919663)
 ]
 TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
@@ -482,6 +492,100 @@ async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True)
             candidates += await collect(c, include_seen=True)
 
     return random.choice(candidates) if candidates else (None, None)
+
+
+@app.on_raw_update(group=-1)  # обрабатываем раньше остальных
+async def raw_discussion_diag(client: Client, update, users, chats):
+    # пропускаем всё, пока не знаем связку
+    if not LINKED_DISCUSSION_ID:
+        return
+
+    # интересуют только новые сообщения в каналах/супергруппах (в т.ч. комменты)
+    if not isinstance(update, UpdateNewChannelMessage):
+        return
+
+    raw = update.message
+    ch_id = getattr(getattr(raw, "peer_id", None), "channel_id", None)
+    if ch_id is None:
+        return
+    chat_id = _channel_to_chat_id(ch_id)
+
+    # логируем только обсуждение целевого канала
+    if chat_id != LINKED_DISCUSSION_ID:
+        return
+
+    # 1) «сырые» поля апдейта (видны даже без high-level Message)
+    print(
+        f"🧩 [RAW] upd in discussion: raw_mid={getattr(raw,'id',None)} "
+        f"pts={getattr(update,'pts',None)} pts_count={getattr(update,'pts_count',None)} "
+        f"chat_id={chat_id}"
+    )
+
+    # 2) пробуем поднять high-level Message (удобнее дальше работать)
+    try:
+        m: Message = await client.get_messages(chat_id, raw.id)
+    except Exception as e:
+        print(f"❌ [RAW] get_messages failed chat={chat_id} id={getattr(raw,'id',None)}: {e}")
+        return
+
+    txt = (m.text or m.caption or "").strip()
+    print(
+        f"💡 [RAW] got comment HL id={m.id} out={m.outgoing} "
+        f"reply_to={m.reply_to_message_id} top={getattr(m,'reply_to_top_message_id',None)} "
+        f"has_text={bool(txt)}"
+    )
+    if txt:
+        print(f"📝 [RAW] text: {_short(txt, 200)}")
+
+    # (необязательно) Ответ прямо из RAW — чтобы зафиксировать полный цикл
+    if RAW_REPLY and not m.outgoing and txt:
+        try:
+            reply_text = await build_reply_for_comment(txt)  # твой промпт не трогаем
+            sent = await client.send_message(
+                chat_id=m.chat.id,
+                text=reply_text,
+                reply_to_message_id=m.id,
+                parse_mode=ParseMode.HTML
+            )
+            print(f"✅ [RAW] replied with msg_id={sent.id}")
+        except FloodWait as e:
+            print(f"⏳ [RAW] FloodWait {e.value}s on send; sleeping")
+            await asyncio.sleep(e.value + 1)
+        except RPCError as e:
+            print(f"❌ [RAW] send failed: {e}")
+
+
+@app.on_message(filters.me & filters.command("diag", prefixes=[".", "/"]))
+async def diag_cmd(_, msg: Message):
+    lines = []
+    lines.append("🔎 DIAG")
+    lines.append(f"TARGET_CHAT_ID={TARGET_CHAT_ID}")
+    lines.append(f"LINKED_DISCUSSION_ID={LINKED_DISCUSSION_ID}")
+    lines.append(f"REPLY_PROBABILITY={REPLY_PROBABILITY}")
+    lines.append(f"ENABLE_DISCUSSION_POLLER={ENABLE_DISCUSSION_POLLER}")
+    lines.append(f"GEMINI={'✅' if client else '❌'}")
+
+    # проверка доступа и статуса в обсуждении
+    if LINKED_DISCUSSION_ID:
+        try:
+            me = await app.get_chat_member(LINKED_DISCUSSION_ID, "me")
+            lines.append(f"status_in_discussion={getattr(me,'status',None)}")
+        except Exception as e:
+            lines.append(f"status_in_discussion=ERR {e}")
+
+        # топ последних сообщений
+        try:
+            cnt = 0
+            async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=3):
+                cnt += 1
+                lines.append(f"last[{cnt}] id={m.id} out={m.outgoing} "
+                             f"reply_to={m.reply_to_message_id} "
+                             f"top={getattr(m,'reply_to_top_message_id',None)} "
+                             f"text={_short((m.text or m.caption or ''),60)}")
+        except Exception as e:
+            lines.append(f"history=ERR {e}")
+
+    await msg.reply_text("\n".join(lines))
 
 # ---------- команды ----------
 @app.on_message(filters.me & filters.command("random", prefixes=[".", "/"]))
