@@ -7,12 +7,13 @@ import time
 from dotenv import load_dotenv
 import os
 import html
+import pyrogram
 
 from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, FileReferenceExpired, RPCError, Unauthorized, AuthKeyUnregistered
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
-import pyrogram
+
 
 # ===== Gemini: новый SDK =====
 from google import genai
@@ -253,45 +254,42 @@ async def add_comment_to_post(target_msg: Message):
         print(f"❌ Ошибка при комментировании: {e}")
 
 
-@app.on_message(filters.incoming & ~filters.service)
+@app.on_message(~filters.service, group=1)
 async def discussion_router(_, m: Message):
-    # Ждём, пока мы узнаем ID обсуждения
+    # ждём, пока узнаем ID обсуждения
     if not LINKED_DISCUSSION_ID:
         return
 
-    # Берём только сообщения из нужной группы обсуждения
+    # берём только нужную группу обсуждения
     if not m.chat or m.chat.id != LINKED_DISCUSSION_ID:
         return
 
-    # Не реагируем на свои сообщения
-    if m.from_user and m.from_user.is_self:
-        dbg_reply(f"⏭️ [ROUTER] own message skip id={m.id}")
-        return
-
-    # Текст комментария
     txt = (m.text or m.caption or "").strip()
-    # Для форум-топиков полезно увидеть маркеры
     is_topic = getattr(m, "is_topic_message", False)
     top_id   = getattr(m, "reply_to_top_message_id", None)
 
-    # Логи принятия комментария — то, чего сейчас нет в логах
-    print(f"💡 [DISCUSSION] got comment id={m.id} topic={is_topic} top={top_id} "
+    # лог факта приёма комментария — нужен именно он
+    print(f"💡 [DISCUSSION] got comment id={m.id} "
+          f"outgoing={m.outgoing} topic={is_topic} top={top_id} "
           f"reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
+
+    # отвечаем только на НЕ свои сообщения, но лог выше оставляем всегда
+    if m.outgoing:
+        return
 
     if not txt:
         dbg_reply(f"⏭️ [ROUTER] empty text id={m.id}")
         return
 
-    # Вероятность ответа
+    # вероятность ответа как раньше
     rnd = random.random()
     if rnd > REPLY_PROBABILITY:
         dbg_reply(f"⏭️ [ROUTER] skip by probability rnd={rnd:.2f} > p={REPLY_PROBABILITY}")
         return
 
-    # Генерим и шлём ответ
     try:
         dbg_reply(f"💬 [ROUTER] generating for msg_id={m.id}: {_short(txt, 200)}")
-        reply_text = await build_reply_for_comment(txt)
+        reply_text = await build_reply_for_comment(txt)   # твой промпт не меняю
         sent = await app.send_message(
             chat_id=m.chat.id,
             text=reply_text,
