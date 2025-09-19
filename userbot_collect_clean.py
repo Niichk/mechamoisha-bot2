@@ -243,9 +243,9 @@ async def build_reply_for_comment(user_text: str) -> str:
         "Формат: прямой ответ без преамбул и смайлов\n\n"
         f"Комментарий: {user_text}\nОтвет:"
     )
-    dbg_gemini(f"[REPLY] build for: {_short(user_text, 200)}")
-    txt = await asyncio.to_thread(_gen_text_sync, prompt, max_tokens=80, temperature=0.9)
-    dbg_gemini(f"[REPLY] built: {_short(txt, 200)}")
+    dbg_gemini(f"[REPLY] build for: {_short(user_text, 2000)}")
+    txt = await asyncio.to_thread(_gen_text_sync, prompt, max_tokens=800, temperature=0.9)
+    dbg_gemini(f"[REPLY] built: {_short(txt, 2000)}")
     return html.escape(txt) if txt else "Окей."
 
 # ---------- Комментирование поста канала ----------
