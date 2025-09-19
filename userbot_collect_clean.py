@@ -10,6 +10,7 @@ import os
 import html
 
 from pyrogram import Client, filters, idle
+from pyrogram.handlers import MessageHandler
 from pyrogram.errors import FloodWait, FileReferenceExpired, RPCError, Unauthorized, AuthKeyUnregistered
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
@@ -33,7 +34,7 @@ SOURCE_CHATS = [
 TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
 
-LINKED_DISCUSSION_ID = -1001636680420  
+LINKED_DISCUSSION_ID = None 
 REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "1.0"))  # 0..1 — как часто отвечать
 
 # >>> ЧАСТОТА <<<
@@ -154,23 +155,62 @@ async def send_clean(app: Client, msg: Message, target_id: int | str) -> Message
         )
     return None
 
-async def resolve_linked_discussion():
+async def resolve_linked_discussion(ensure_join: bool = True, test_read: bool = True) -> int | None:
+    """
+    Находит связанную группу обсуждений для TARGET_CHAT_ID и (опционально) вступает в неё.
+    Сохраняет значение в глобальной переменной LINKED_DISCUSSION_ID и возвращает его.
+    Вызывать сразу после `await app.start()`.
+    """
     global LINKED_DISCUSSION_ID
+
+    # 1) Получаем канал и его связку
     try:
-        chat = await app.get_chat(TARGET_CHAT_ID)
-        linked = getattr(chat, "linked_chat", None)
-        if linked:
-            LINKED_DISCUSSION_ID = linked.id
-            print(f"✅ Linked discussion ID: {LINKED_DISCUSSION_ID}")
-            return LINKED_DISCUSSION_ID
-        else:
-            print("⚠️ У канала нет связанной группы (включи Обсуждения)")
-            LINKED_DISCUSSION_ID = None
-            return None
-    except Exception as e:
-        print(f"❌ resolve_linked_discussion error: {e}")
+        ch = await app.get_chat(TARGET_CHAT_ID)
+    except RPCError as e:
+        print(f"❌ resolve_linked_discussion: не смог получить канал {TARGET_CHAT_ID}: {e}")
         LINKED_DISCUSSION_ID = None
         return None
+
+    linked = getattr(ch, "linked_chat", None)
+    if not linked:
+        print("❌ У канала нет связанной группы (включи «Обсуждения» в настройках).")
+        LINKED_DISCUSSION_ID = None
+        return None
+
+    linked_id = linked.id
+    print(f"✅ Linked discussion ID: {linked_id}")
+
+    # 2) При необходимости — проверяем членство и вступаем
+    if ensure_join:
+        try:
+            me = await app.get_chat_member(linked_id, "me")
+            status = getattr(me, "status", None)
+            print(f"👤 Мой статус в обсуждении: {status}")
+        except RPCError:
+            status = None
+
+        # если не участник / изгнан / статуса нет — пробуем вступить
+        if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
+            try:
+                await app.join_chat(linked_id)
+                print("✅ Вступил в обсуждение")
+            except RPCError as e:
+                print(f"⚠️ Не смог вступить в обсуждение: {e}")
+
+    # 3) Опционально проверяем, что можем читать апдейты (историю)
+    if test_read:
+        try:
+            _seen = False
+            async for _ in app.get_chat_history(linked_id, limit=1):
+                _seen = True
+                break
+            if _seen:
+                print("📚 Историю обсуждения читаю ок")
+        except RPCError as e:
+            print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+
+    LINKED_DISCUSSION_ID = linked_id
+    return LINKED_DISCUSSION_ID
 
 # ---------- Gemini: генерация кусочка «кода» как простого текста ----------
 FALLBACK_SNIPPET = """<div>
@@ -458,6 +498,34 @@ async def diag_comments(_, msg: Message):
     info.append(f"Every N: {COMMENT_EVERY_N}; Auto: {'ON' if ENABLE_AUTO_COMMENTS else 'OFF'}")
     await msg.reply_text("\n".join(info))
 
+async def discussion_poll_loop():
+    if not LINKED_DISCUSSION_ID:
+        return
+    last_id = int(get_meta("last_disc_msg_id", "0") or 0)
+    if last_id == 0:
+        async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=1):
+            last_id = m.id
+            set_meta("last_disc_msg_id", str(last_id))
+            break
+    while True:
+        try:
+            batch = []
+            async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=50):
+                if m.id <= last_id:
+                    break
+                batch.append(m)
+            for m in reversed(batch):
+                # имитируем on_message
+                await discussion_tap(app, m)
+                await discussion_autoreply(app, m)
+                last_id = max(last_id, m.id)
+                set_meta("last_disc_msg_id", str(last_id))
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:
+            print(f"[discussion_poll] error: {e}")
+        await asyncio.sleep(3)  # частота опроса
+
 # ---------- Планировщик постинга по интервалу ----------
 async def scheduler_loop():
     await asyncio.sleep(5)
@@ -478,6 +546,30 @@ async def scheduler_loop():
         except Exception as e:
             print(f"[scheduler] error: {e}")
         await asyncio.sleep(POST_EVERY_SECONDS)
+
+
+async def discussion_tap(_, m: Message):
+    print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} "
+          f"text={(m.text or m.caption or '')[:80]}")
+
+async def discussion_autoreply(_, m: Message):
+    # не отвечаем на себя
+    if m.from_user and m.from_user.is_self:
+        return
+    txt = (m.text or m.caption or "").strip()
+    if not txt:
+        return
+    # если нужна вероятность
+    import random
+    if random.random() > REPLY_PROBABILITY:
+        return
+    reply_text = await build_reply_for_comment(txt)
+    await app.send_message(
+        chat_id=m.chat.id,
+        text=reply_text,
+        reply_to_message_id=m.id,
+        parse_mode=ParseMode.HTML
+    )
 
 # ---------- Вотчер канала: комментит любой новый пост ----------
 async def comment_watcher_loop():
@@ -549,6 +641,7 @@ if __name__ == "__main__":
         try:
             print("🔄 Запускаем userbot...")
             await app.start()
+            await resolve_linked_discussion()
             print("✅ Userbot запущен")
             
             # Получаем информацию о себе
@@ -577,6 +670,8 @@ if __name__ == "__main__":
             # Запускаем фоновые задачи
             asyncio.create_task(scheduler_loop())
             asyncio.create_task(comment_watcher_loop())
+            asyncio.create_task(discussion_poll_loop())
+
             
             print("🎯 Все системы запущены, бот готов к работе!")
             await idle()
