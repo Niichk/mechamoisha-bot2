@@ -337,6 +337,16 @@ async def on_discussion_message(_, msg: Message):
         print(f"💬 Ответил на комментарий {msg.id}")
     except RPCError as e:
         print(f"❌ Не смог ответить: {e}")
+        
+
+@app.on_message(~filters.service)
+async def _tap(_, m: Message):
+    if not LINKED_DISCUSSION_ID or not m.chat: 
+        return
+    if m.chat.id == LINKED_DISCUSSION_ID:
+        print(f"[DISCUSSION] got id={m.id} reply_to={m.reply_to_message_id} "
+              f"thread={getattr(m,'message_thread_id',None)} "
+              f"text={(m.text or m.caption or '')[:60]}")
 
 # ---------- Выбор случайного кандидата из истории ----------
 async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True):
