@@ -27,21 +27,23 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 # >>> ИСТОЧНИКИ И ЦЕЛЬ <<<
 SOURCE_CHATS = [
-    -1001933529111, -1002023792120, -1001709947448, -1001233757145,
-    -1001754939025, -1001800495747, -1001515875171, -1001122293538, -1001152239718, -1002143859013, 
-    -1001756721537, -1002008586908
+    -1001423363475, -1001304740791, -1001628148774, -1002092838245, -1001096054832, -1001334218632,
+    -1001431200947, -1001268741369, -1001647745905, -1001980097656, -1001544919663
 ]
 TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
 
+LINKED_DISCUSSION_ID = -1001636680420  
+REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "1.0"))  # 0..1 — как часто отвечать
+
 # >>> ЧАСТОТА <<<
 ENABLE_LIVE_STREAM = True
-POST_EVERY_SECONDS = 40 * 60
+POST_EVERY_SECONDS = 80 * 60
 PER_CHAT_SCAN_LIMIT = 500
 
 # >>> КОММЕНТАРИИ <<<
 ENABLE_AUTO_COMMENTS = True
-COMMENT_EVERY_N = 6
+COMMENT_EVERY_N = 10
 CHANNEL_POLL_SECONDS = 10   # как часто сканировать канал на новые посты
 
 # ====== Gemini ======
@@ -152,6 +154,19 @@ async def send_clean(app: Client, msg: Message, target_id: int | str) -> Message
         )
     return None
 
+async def resolve_linked_discussion():
+    global LINKED_DISCUSSION_ID
+    try:
+        chat = await app.get_chat(TARGET_CHAT_ID)
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            LINKED_DISCUSSION_ID = linked.id
+            print(f"✅ Linked discussion ID: {LINKED_DISCUSSION_ID}")
+        else:
+            print("⚠️ У канала нет связанной группы (включи Обсуждения)")
+    except Exception as e:
+        print(f"resolve_linked_discussion error: {e}")
+
 # ---------- Gemini: генерация кусочка «кода» как простого текста ----------
 FALLBACK_SNIPPET = """<div>
   <button id="prev-button">Previous</button>
@@ -163,10 +178,7 @@ def _gen_code_snippet_sync() -> str:
     if not gemini_model:
         return FALLBACK_SNIPPET
     prompt = (
-        "Generate a large, meaningless code snippet (10-30 lines). "
-        "Pick randomly ONE language: HTML, JavaScript, CSS or Python. "
-        "Return CODE ONLY (no markdown fences, no comments, no explanation)."
-        "Make it look scary, like it does something complex, but it should be meaningless gibberish."
+        "Generate a wise thought like you are a Jewish rabbi"
     )
     try:
         resp = gemini_model.generate_content(
@@ -193,22 +205,71 @@ async def build_random_code_comment() -> str:
 
 # ---------- Комментирование поста канала ----------
 async def add_comment_to_post(target_msg: Message):
-    """
-    Правильный способ: взять сообщение обсуждения поста канала
-    и ответить на него -> это и будет комментарий.  :contentReference[oaicite:2]{index=2}
-    """
     if not ENABLE_AUTO_COMMENTS:
         return
     text = await build_random_code_comment()
     try:
-        discussion_msg = await app.get_discussion_message(TARGET_CHAT_ID, target_msg.id)
+        discussion_msg = await app.get_discussion_message(target_msg.chat.id, target_msg.id)
         if not discussion_msg:
-            print("❌ Нет обсуждения у поста (возможно, пост до включения комментариев).")
+            print("❌ Нет обсуждения у поста — пропустил")
             return
         await send_with_retry(discussion_msg.reply, text, parse_mode=ParseMode.HTML)
         print(f"✅ Комментарий отправлен к посту {target_msg.id}")
     except RPCError as e:
         print(f"❌ Ошибка при комментировании: {e}")
+
+
+async def build_reply_for_comment(user_text: str) -> str:
+    """
+    Короткий ответ-шутка на комментарий пользователя.
+    """
+    if not user_text:
+        user_text = "."
+
+    system_hint = (
+        "Ты пишешь очень короткие остроумные ответы (1–2 предложения) на русскоязычные комментарии. "
+        "Твои ответ должен быть анекдотом в стиле про евреев, но не оскорбительным. "
+        "Анекдот может быть в формате еврей, русский и немец сидят где-то... "
+        "Формат: прямой ответ без преамбул и смайлов"
+    )
+    user_prompt = f"Комментарий:\n{user_text}\n\nОтвет:"
+
+    # умеренно «либеральные» пороги блокировки — позволят безобидные шутки,
+    # но отсекут токс и жесть (см. Safety settings в Gemini API).
+    safety = [
+        genai.types.SafetySetting(
+            category=genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+        ),
+        genai.types.SafetySetting(
+            category=genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+        ),
+        genai.types.SafetySetting(
+            category=genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+        ),
+        genai.types.SafetySetting(
+            category=genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=genai.types.HarmBlockThreshold.BLOCK_NONE
+        ),
+    ]
+
+    try:
+        resp = gemini_model.generate_content(
+            [system_hint, user_prompt],
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=80,
+                temperature=0.9,
+                top_p=0.95
+            ),
+            safety_settings=safety  # см. гайд по safety_settings
+        )
+        text = (resp.text or "").strip()
+        return html.escape(text)[:1000] if text else "Окей 🙂"
+    except Exception as e:
+        print(f"Gemini error: {e}")
+        return "Окей 🙂"
 
 # ---------- LIVE-хендлер: поток из источников ----------
 @app.on_message(filters.chat(EFFECTIVE_SOURCE_CHATS) & (filters.photo | filters.document))
@@ -236,6 +297,46 @@ async def handler(_, msg: Message):
         sent = await send_clean(app, fresh, TARGET_CHAT_ID)
         if uid: mark_seen(uid)
         print(f"📤 Отправлено (refreshed): message_id={sent.id if sent else 'None'}")
+
+
+@app.on_message(~filters.service)
+async def on_discussion_message(_, msg: Message):
+    # ждём, пока получим id связанной группы
+    if not LINKED_DISCUSSION_ID:
+        return
+
+    # не зацикливаться на своих же ответах
+    if msg.from_user and msg.from_user.is_self:
+        return
+
+    # реагируем только в связанной группе
+    if not msg.chat or msg.chat.id != LINKED_DISCUSSION_ID:
+        return
+
+    # текст комментария (или подпись к фото/доку)
+    text = msg.text or msg.caption or ""
+    if not text.strip():
+        return
+
+    # (опционально) не отвечать на КАЖДОЕ сообщение
+    import random
+    if random.random() > REPLY_PROBABILITY:
+        return
+
+    reply_text = await build_reply_for_comment(text)
+
+    # Отвечаем прямо на комментарий в том же треде
+    try:
+        await send_with_retry(
+            app.send_message,
+            chat_id=msg.chat.id,
+            text=reply_text,
+            reply_to_message_id=msg.id,
+            parse_mode=ParseMode.HTML
+        )
+        print(f"💬 Ответил на комментарий {msg.id}")
+    except RPCError as e:
+        print(f"❌ Не смог ответить: {e}")
 
 # ---------- Выбор случайного кандидата из истории ----------
 async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True):
@@ -396,6 +497,7 @@ if __name__ == "__main__":
 
     async def main():
         await app.start()
+        await resolve_linked_discussion()   # <-- ВАЖНО: сразу после старта
         asyncio.create_task(scheduler_loop())
         asyncio.create_task(comment_watcher_loop())
         await idle()
