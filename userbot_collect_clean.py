@@ -277,8 +277,17 @@ async def handler(_, msg: Message):
 _HANDLERS_BOUND = False
 async def bind_discussion_handlers():
     global _HANDLERS_BOUND
-    if _HANDLERS_BOUND or not LINKED_DISCUSSION_ID:
+    
+    # ✅ ИСПРАВЛЕНИЕ: Проверяем ID перед привязкой
+    if not LINKED_DISCUSSION_ID:
+        print("❌ LINKED_DISCUSSION_ID не установлен, пропускаем привязку handlers")
         return
+        
+    if _HANDLERS_BOUND:
+        print("⚠️ Handlers уже привязаны")
+        return
+
+    print(f"🔗 Привязываем обработчики к группе {LINKED_DISCUSSION_ID}")
 
     async def discussion_tap(_, m: Message):
         txt = (m.text or m.caption or "").strip()
@@ -288,10 +297,12 @@ async def bind_discussion_handlers():
     async def discussion_autoreply(_, m: Message):
         # не отвечаем на себя
         if m.from_user and m.from_user.is_self:
+            print(f"⏭️ [REPLY] Пропускаем собственное сообщение: {m.id}")
             return
 
         txt = (m.text or m.caption or "").strip()
         if not txt:
+            print(f"⏭️ [REPLY] Пустое сообщение: {m.id}")
             return
 
         # вероятность ответа
@@ -315,14 +326,30 @@ async def bind_discussion_handlers():
         except RPCError as e:
             dbg_reply(f"❌ [REPLY] send failed: {e}")
 
+    # ✅ ВАЖНО: Проверяем что ID корректный
+    try:
+        # Тестируем доступ к группе
+        test_chat = await app.get_chat(LINKED_DISCUSSION_ID)
+        print(f"✅ Группа обсуждения найдена: {test_chat.title}")
+    except Exception as e:
+        print(f"❌ Не удалось получить группу {LINKED_DISCUSSION_ID}: {e}")
+        return
+
     app.add_handler(
-        pyrogram.handlers.MessageHandler(discussion_tap, filters.chat(LINKED_DISCUSSION_ID) & ~filters.service)
+        pyrogram.handlers.MessageHandler(
+            discussion_tap, 
+            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service
+        )
     )
     app.add_handler(
-        pyrogram.handlers.MessageHandler(discussion_autoreply, filters.chat(LINKED_DISCUSSION_ID) & ~filters.service & ~filters.me)
+        pyrogram.handlers.MessageHandler(
+            discussion_autoreply, 
+            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service & ~filters.me
+        )
     )
+    
     _HANDLERS_BOUND = True
-    print("🔗 Discussion handlers bound")
+    print(f"🔗 Discussion handlers successfully bound to {LINKED_DISCUSSION_ID}")
 
 # ---------- резервный опрос обсуждения ----------
 async def discussion_poll_loop():
@@ -504,49 +531,54 @@ if __name__ == "__main__":
     print("🚀 Starting userbot (interval repost + watcher comments + Gemini)…")
 
     async def resolve_linked_discussion(ensure_join: bool = True, test_read: bool = True) -> int | None:
-        """Ищем связанную группу обсуждений канала и (при необходимости) входим туда."""
-        global LINKED_DISCUSSION_ID
+    """Ищем связанную группу обсуждений канала и (при необходимости) входим туда."""
+    global LINKED_DISCUSSION_ID
+    
+    try:
+        ch = await app.get_chat(TARGET_CHAT_ID)
+    except RPCError as e:
+        print(f"❌ Не смог получить канал {TARGET_CHAT_ID}: {e}")
+        LINKED_DISCUSSION_ID = None
+        return None
+
+    linked = getattr(ch, "linked_chat", None)
+    if not linked:
+        print("❌ У канала нет связанной группы (включи «Обсуждения»).")
+        LINKED_DISCUSSION_ID = None
+        return None
+
+    linked_id = linked.id
+    print(f"✅ Linked discussion ID: {linked_id}")
+
+    # ✅ СНАЧАЛА устанавливаем ID
+    LINKED_DISCUSSION_ID = linked_id
+
+    if ensure_join:
         try:
-            ch = await app.get_chat(TARGET_CHAT_ID)
-        except RPCError as e:
-            print(f"❌ Не смог получить канал {TARGET_CHAT_ID}: {e}")
-            LINKED_DISCUSSION_ID = None
-            return None
-
-        linked = getattr(ch, "linked_chat", None)
-        if not linked:
-            print("❌ У канала нет связанной группы (включи «Обсуждения»).")
-            LINKED_DISCUSSION_ID = None
-            return None
-
-        linked_id = linked.id
-        print(f"✅ Linked discussion ID: {linked_id}")
-
-        if ensure_join:
+            me = await app.get_chat_member(linked_id, "me")
+            status = getattr(me, "status", None)
+            print(f"👤 Мой статус в обсуждении: {status}")
+        except RPCError:
+            status = None
+        if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
             try:
-                me = await app.get_chat_member(linked_id, "me")
-                status = getattr(me, "status", None)
-                print(f"👤 Мой статус в обсуждении: {status}")
-            except RPCError:
-                status = None
-            if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
-                try:
-                    await app.join_chat(linked_id)
-                    print("✅ Вступил в обсуждение")
-                except RPCError as e:
-                    print(f"⚠️ Не смог вступить: {e}")
-
-        if test_read:
-            try:
-                async for _ in app.get_chat_history(linked_id, limit=1):
-                    pass
-                print("📚 Историю обсуждения читаю ок")
+                await app.join_chat(linked_id)
+                print("✅ Вступил в обсуждение")
             except RPCError as e:
-                print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+                print(f"⚠️ Не смог вступить: {e}")
 
-        LINKED_DISCUSSION_ID = linked_id
-        await bind_discussion_handlers()  # вешаем хендлеры на конкретную группу
-        return LINKED_DISCUSSION_ID
+    if test_read:
+        try:
+            async for _ in app.get_chat_history(linked_id, limit=1):
+                pass
+            print("📚 Историю обсуждения читаю ок")
+        except RPCError as e:
+            print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+
+    # ✅ ТЕПЕРЬ привязываем обработчики (когда ID уже установлен)
+    await bind_discussion_handlers()
+    
+    return LINKED_DISCUSSION_ID
 
     async def main():
         try:
