@@ -306,7 +306,8 @@ async def bind_discussion_handlers():
         if random.random() > REPLY_PROBABILITY:
             return
         reply_text = await build_reply_for_comment(txt)
-        await app.send_message(
+        try:
+            await app.send_message(
                 chat_id=m.chat.id,
                 text=reply_text,                  # тут уже html.escape(...)
                 reply_to_message_id=m.id,
