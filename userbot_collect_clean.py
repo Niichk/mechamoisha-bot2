@@ -252,6 +252,59 @@ async def add_comment_to_post(target_msg: Message):
     except RPCError as e:
         print(f"❌ Ошибка при комментировании: {e}")
 
+
+@app.on_message(filters.incoming & ~filters.service)
+async def discussion_router(_, m: Message):
+    # Ждём, пока мы узнаем ID обсуждения
+    if not LINKED_DISCUSSION_ID:
+        return
+
+    # Берём только сообщения из нужной группы обсуждения
+    if not m.chat or m.chat.id != LINKED_DISCUSSION_ID:
+        return
+
+    # Не реагируем на свои сообщения
+    if m.from_user and m.from_user.is_self:
+        dbg_reply(f"⏭️ [ROUTER] own message skip id={m.id}")
+        return
+
+    # Текст комментария
+    txt = (m.text or m.caption or "").strip()
+    # Для форум-топиков полезно увидеть маркеры
+    is_topic = getattr(m, "is_topic_message", False)
+    top_id   = getattr(m, "reply_to_top_message_id", None)
+
+    # Логи принятия комментария — то, чего сейчас нет в логах
+    print(f"💡 [DISCUSSION] got comment id={m.id} topic={is_topic} top={top_id} "
+          f"reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
+
+    if not txt:
+        dbg_reply(f"⏭️ [ROUTER] empty text id={m.id}")
+        return
+
+    # Вероятность ответа
+    rnd = random.random()
+    if rnd > REPLY_PROBABILITY:
+        dbg_reply(f"⏭️ [ROUTER] skip by probability rnd={rnd:.2f} > p={REPLY_PROBABILITY}")
+        return
+
+    # Генерим и шлём ответ
+    try:
+        dbg_reply(f"💬 [ROUTER] generating for msg_id={m.id}: {_short(txt, 200)}")
+        reply_text = await build_reply_for_comment(txt)
+        sent = await app.send_message(
+            chat_id=m.chat.id,
+            text=reply_text,
+            reply_to_message_id=m.id,
+            parse_mode=ParseMode.HTML
+        )
+        dbg_reply(f"✅ [ROUTER] sent reply_id={sent.id} to chat={sent.chat.id}")
+    except FloodWait as e:
+        dbg_reply(f"⏳ [ROUTER] FloodWait {e.value}s on send; sleeping")
+        await asyncio.sleep(e.value + 1)
+    except RPCError as e:
+        dbg_reply(f"❌ [ROUTER] send failed: {e}")
+
 # ---------- поток из источников ----------
 @app.on_message(filters.chat(EFFECTIVE_SOURCE_CHATS) & (filters.photo | filters.document))
 async def handler(_, msg: Message):
@@ -276,80 +329,10 @@ async def handler(_, msg: Message):
 # ---------- динамические хендлеры для обсуждения ----------
 _HANDLERS_BOUND = False
 async def bind_discussion_handlers():
+    # Динамическая привязка больше не нужна — используем декоратор discussion_router
     global _HANDLERS_BOUND
-    
-    # ✅ ИСПРАВЛЕНИЕ: Проверяем ID перед привязкой
-    if not LINKED_DISCUSSION_ID:
-        print("❌ LINKED_DISCUSSION_ID не установлен, пропускаем привязку handlers")
-        return
-        
-    if _HANDLERS_BOUND:
-        print("⚠️ Handlers уже привязаны")
-        return
-
-    print(f"🔗 Привязываем обработчики к группе {LINKED_DISCUSSION_ID}")
-
-    async def discussion_tap(_, m: Message):
-        txt = (m.text or m.caption or "").strip()
-        if txt:
-            print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
-
-    async def discussion_autoreply(_, m: Message):
-        # не отвечаем на себя
-        if m.from_user and m.from_user.is_self:
-            print(f"⏭️ [REPLY] Пропускаем собственное сообщение: {m.id}")
-            return
-
-        txt = (m.text or m.caption or "").strip()
-        if not txt:
-            print(f"⏭️ [REPLY] Пустое сообщение: {m.id}")
-            return
-
-        # вероятность ответа
-        rnd = random.random()
-        if rnd > REPLY_PROBABILITY:
-            dbg_reply(f"⏭️ [REPLY] skip by probability rnd={rnd:.2f} > p={REPLY_PROBABILITY}")
-            return
-
-        dbg_reply(f"💬 [REPLY] generating for msg_id={m.id}: {_short(txt, 200)}")
-        reply_text = await build_reply_for_comment(txt)
-        dbg_reply(f"💬 [REPLY] ready -> {_short(html.unescape(reply_text), 200)}")
-
-        try:
-            sent = await app.send_message(
-                chat_id=m.chat.id,
-                text=reply_text,
-                reply_to_message_id=m.id,
-                parse_mode=ParseMode.HTML
-            )
-            dbg_reply(f"✅ [REPLY] sent reply_id={sent.id} to chat={sent.chat.id}")
-        except RPCError as e:
-            dbg_reply(f"❌ [REPLY] send failed: {e}")
-
-    # ✅ ВАЖНО: Проверяем что ID корректный
-    try:
-        # Тестируем доступ к группе
-        test_chat = await app.get_chat(LINKED_DISCUSSION_ID)
-        print(f"✅ Группа обсуждения найдена: {test_chat.title}")
-    except Exception as e:
-        print(f"❌ Не удалось получить группу {LINKED_DISCUSSION_ID}: {e}")
-        return
-
-    app.add_handler(
-        pyrogram.handlers.MessageHandler(
-            discussion_tap, 
-            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service
-        )
-    )
-    app.add_handler(
-        pyrogram.handlers.MessageHandler(
-            discussion_autoreply, 
-            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service & ~filters.me
-        )
-    )
-    
     _HANDLERS_BOUND = True
-    print(f"🔗 Discussion handlers successfully bound to {LINKED_DISCUSSION_ID}")
+    print(f"🔗 Discussion router (decorator) is active for chat {LINKED_DISCUSSION_ID}")
 
 # ---------- резервный опрос обсуждения ----------
 async def discussion_poll_loop():
