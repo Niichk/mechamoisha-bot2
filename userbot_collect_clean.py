@@ -30,7 +30,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "1") == "1"   # 1 = подробные логи Gemini
 DEBUG_REPLY  = os.getenv("DEBUG_REPLY",  "1") == "1"   # 1 = подробные логи ответов
-ENABLE_DISCUSSION_POLLER = os.getenv("ENABLE_DISCUSSION_POLLER", "0") == "1"  # резервный поллер (по умолчанию выкл)
+ENABLE_DISCUSSION_POLLER = os.getenv("ENABLE_DISCUSSION_POLLER", "1") == "1"  # резервный поллер (по умолчанию выкл)
 
 def _short(s: str | None, n: int = 350) -> str:
     if not s:
@@ -264,55 +264,6 @@ async def add_comment_to_post(target_msg: Message):
         print(f"❌ Ошибка при комментировании: {e}")
 
 
-@app.on_message(~filters.service, group=1)
-async def discussion_router(_, m: Message):
-    # ждём, пока узнаем ID обсуждения
-    if not LINKED_DISCUSSION_ID:
-        return
-
-    # берём только нужную группу обсуждения
-    if not m.chat or m.chat.id != LINKED_DISCUSSION_ID:
-        return
-
-    txt = (m.text or m.caption or "").strip()
-    is_topic = getattr(m, "is_topic_message", False)
-    top_id   = getattr(m, "reply_to_top_message_id", None)
-
-    # лог факта приёма комментария — нужен именно он
-    print(f"💡 [DISCUSSION] got comment id={m.id} "
-          f"outgoing={m.outgoing} topic={is_topic} top={top_id} "
-          f"reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
-
-    # отвечаем только на НЕ свои сообщения, но лог выше оставляем всегда
-    if m.outgoing:
-        return
-
-    if not txt:
-        dbg_reply(f"⏭️ [ROUTER] empty text id={m.id}")
-        return
-
-    # вероятность ответа как раньше
-    rnd = random.random()
-    if rnd > REPLY_PROBABILITY:
-        dbg_reply(f"⏭️ [ROUTER] skip by probability rnd={rnd:.2f} > p={REPLY_PROBABILITY}")
-        return
-
-    try:
-        dbg_reply(f"💬 [ROUTER] generating for msg_id={m.id}: {_short(txt, 200)}")
-        reply_text = await build_reply_for_comment(txt)   # твой промпт не меняю
-        sent = await app.send_message(
-            chat_id=m.chat.id,
-            text=reply_text,
-            reply_to_message_id=m.id,
-            parse_mode=ParseMode.HTML
-        )
-        dbg_reply(f"✅ [ROUTER] sent reply_id={sent.id} to chat={sent.chat.id}")
-    except FloodWait as e:
-        dbg_reply(f"⏳ [ROUTER] FloodWait {e.value}s on send; sleeping")
-        await asyncio.sleep(e.value + 1)
-    except RPCError as e:
-        dbg_reply(f"❌ [ROUTER] send failed: {e}")
-
 # ---------- поток из источников ----------
 @app.on_message(filters.chat(EFFECTIVE_SOURCE_CHATS) & (filters.photo | filters.document))
 async def handler(_, msg: Message):
@@ -337,10 +288,52 @@ async def handler(_, msg: Message):
 # ---------- динамические хендлеры для обсуждения ----------
 _HANDLERS_BOUND = False
 async def bind_discussion_handlers():
-    # Динамическая привязка больше не нужна — используем декоратор discussion_router
     global _HANDLERS_BOUND
+    if _HANDLERS_BOUND or not LINKED_DISCUSSION_ID:
+        return
+
+    async def discussion_tap(_, m: Message):
+        # Логируем принятие комментария
+        txt = (m.text or m.caption or "").strip()
+        print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
+
+    async def discussion_autoreply(_, m: Message):
+        if m.from_user and m.from_user.is_self:
+            return
+        txt = (m.text or m.caption or "").strip()
+        if not txt:
+            return
+        if random.random() > REPLY_PROBABILITY:
+            return
+        reply_text = await build_reply_for_comment(txt)
+        try:
+            await app.send_message(
+                chat_id=m.chat.id,
+                text=reply_text,
+                reply_to_message_id=m.id,
+                parse_mode=ParseMode.HTML
+            )
+        except RPCError as e:
+            print(f"❌ [REPLY] send failed: {e}")
+
+    app.add_handler(
+        # Узкий фильтр — решает маршрутизацию на уровне Pyrogram!
+        pyrogram.handlers.MessageHandler(
+            discussion_tap,
+            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service
+        ),
+        group=0  # приоритет выше прочих on_message
+    )
+    app.add_handler(
+        pyrogram.handlers.MessageHandler(
+            discussion_autoreply,
+            filters.chat(LINKED_DISCUSSION_ID) & ~filters.service & ~filters.me
+        ),
+        group=0
+    )
+
     _HANDLERS_BOUND = True
-    print(f"🔗 Discussion router (decorator) is active for chat {LINKED_DISCUSSION_ID}")
+    print("🔗 Discussion handlers bound (narrow filter)")
 
 # ---------- резервный опрос обсуждения ----------
 async def discussion_poll_loop():
