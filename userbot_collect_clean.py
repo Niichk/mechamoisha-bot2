@@ -253,7 +253,7 @@ def _gen_wise_snippet_sync() -> str:
 
 async def gen_code_snippet() -> str:
     try:
-        text = await asyncio.to_thread(_gen_code_snippet_sync)
+        text = await asyncio.to_thread(_gen_wise_snippet_sync)
         return (text or FALLBACK_SNIPPET)[:1000]
     except Exception as e:
         log_once(f"❌ gen_code_snippet error: {e}")
