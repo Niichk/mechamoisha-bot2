@@ -28,8 +28,8 @@ SESSION_NAME = os.getenv("SESSION_NAME", "userbot_session")
 WORKDIR = os.getenv("WORKDIR", ".")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "1") == "1"   # 1 = подробные логи Gemini
-DEBUG_REPLY  = os.getenv("DEBUG_REPLY",  "1") == "1"   # 1 = подробные логи ответов
+DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "0") == "1"   # 1 = подробные логи Gemini
+DEBUG_REPLY  = os.getenv("DEBUG_REPLY",  "0") == "1"   # 1 = подробные логи ответов
 ENABLE_DISCUSSION_POLLER = os.getenv("ENABLE_DISCUSSION_POLLER", "1") == "1"  # резервный поллер (по умолчанию выкл)
 
 def _short(s: str | None, n: int = 350) -> str:
@@ -63,7 +63,7 @@ TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
 
 LINKED_DISCUSSION_ID = None
-REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "1.0"))  # 0..1
+REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "0.25"))  # 0..1
 
 # >>> ЧАСТОТА <<<
 ENABLE_LIVE_STREAM = True
@@ -160,11 +160,6 @@ async def send_with_retry(func, *args, **kwargs):
             print(f"⏰ FloodWait: {e.value}s")
             await asyncio.sleep(e.value + 1)
 
-def _clamp_caption(text: str | None) -> str | None:
-    if not text:
-        return None
-    # лимит подписи к медиа — 1024 символа
-    return text[:1024] if len(text) > 1024 else text
 
 def match_image(msg: Message) -> bool:
     return bool(
