@@ -26,9 +26,9 @@ SESSION_NAME = os.getenv("SESSION_NAME", "userbot_session")
 WORKDIR = os.getenv("WORKDIR", ".")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-
-DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "1") == "1"   # 1 = включить подробные логи
-DEBUG_REPLY  = os.getenv("DEBUG_REPLY",  "1") == "1"
+DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "1") == "1"   # 1 = подробные логи Gemini
+DEBUG_REPLY  = os.getenv("DEBUG_REPLY",  "1") == "1"   # 1 = подробные логи ответов
+ENABLE_DISCUSSION_POLLER = os.getenv("ENABLE_DISCUSSION_POLLER", "0") == "1"  # резервный поллер (по умолчанию выкл)
 
 def _short(s: str | None, n: int = 350) -> str:
     if not s:
@@ -153,9 +153,7 @@ def _clamp_caption(text: str | None) -> str | None:
     if not text:
         return None
     # лимит подписи к медиа — 1024 символа
-    if len(text) > 1024:
-        text = text[:1024]
-    return text
+    return text[:1024] if len(text) > 1024 else text
 
 def match_image(msg: Message) -> bool:
     return bool(
@@ -189,24 +187,27 @@ def _gen_text_sync(prompt: str, max_tokens=200, temperature=0.8) -> str:
         return FALLBACK_SNIPPET
     try:
         dbg_gemini(f"[GEMINI] ⇢ prompt: {_short(prompt)}")
+        # В новом SDK достаточно передать СТРОКУ
         resp = client.models.generate_content(
             model="gemini-2.5-flash-lite",
-            contents=[types.Content(role="user", parts=[types.Part.from_text(prompt)])],
+            contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=max_tokens,
                 temperature=temperature
             ),
         )
-        # основные поля ответа
-        txt = (getattr(resp, "text", "") or "").strip()
-        cand = resp.candidates[0] if getattr(resp, "candidates", None) else None
-        finish = getattr(cand, "finish_reason", None)
-        safety = getattr(cand, "safety_ratings", None)
+        # извлекаем текст
+        txt = (getattr(resp, "text", None) or getattr(resp, "output_text", None) or "").strip()
+        if not txt and getattr(resp, "candidates", None):
+            parts = []
+            for p in getattr(resp.candidates[0].content, "parts", []) or []:
+                t = getattr(p, "text", None)
+                if t:
+                    parts.append(t)
+            txt = "\n".join(parts).strip()
+
         usage  = getattr(resp, "usage_metadata", None)
-
-        dbg_gemini(f"[GEMINI] ⇠ text: {_short(txt)}")
-        dbg_gemini(f"[GEMINI]    finish={finish} tokens={getattr(usage,'total_token_count',None)} safety={safety}")
-
+        dbg_gemini(f"[GEMINI] ⇠ text: {_short(txt)} | tokens={getattr(usage,'total_token_count',None)}")
         return txt or FALLBACK_SNIPPET
     except Exception as e:
         dbg_gemini(f"❌ [GEMINI] exception: {e}")
@@ -215,19 +216,21 @@ def _gen_text_sync(prompt: str, max_tokens=200, temperature=0.8) -> str:
 async def build_random_code_comment() -> str:
     txt = await asyncio.to_thread(
         _gen_text_sync,
+        # Ты просил не убирать стиль — оставляю нейтральную «мудрость»; это комментарии под постами.
         "Генерируйте мудрые мысли, как будто вы еврейский раввин, дающий совет о деньгах, женщинах, мойшах и жизни под солнцем"
     )
     return html.escape(txt)
 
 async def build_reply_for_comment(user_text: str) -> str:
-    """Строим короткий ответ на комментарий, с логами до/после."""
+    """Короткий ответ на комментарий с прокидыванием текста комментария в промпт."""
     if not user_text:
         user_text = "."
     prompt = (
         "Ты пишешь короткие остроумные ответы (3–5 предложения) на русскоязычные комментарии. "
         "Твои ответ должен быть анекдотом в стиле про евреев, но не оскорбительным. "
         "Анекдот может быть в формате еврей, русский и немец (или две любых других национальность, но еврей должен быть и он самый мудрый и хитрый) сидят где-то (заходят куда-то)... "
-        "Формат: прямой ответ без преамбул и смайлов"
+        "Формат: прямой ответ без преамбул и смайлов\n\n"
+        f"Комментарий: {user_text}\nОтвет:"
     )
     dbg_gemini(f"[REPLY] build for: {_short(user_text, 200)}")
     txt = await asyncio.to_thread(_gen_text_sync, prompt, max_tokens=80, temperature=0.9)
@@ -278,8 +281,9 @@ async def bind_discussion_handlers():
         return
 
     async def discussion_tap(_, m: Message):
-        print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} "
-              f"text={(m.text or m.caption or '')[:80]}")
+        txt = (m.text or m.caption or "").strip()
+        if txt:
+            print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
 
     async def discussion_autoreply(_, m: Message):
         # не отвечаем на себя
@@ -312,7 +316,6 @@ async def bind_discussion_handlers():
             dbg_reply(f"❌ [REPLY] send failed: {e}")
 
     app.add_handler(
-        # только сообщения из связанной группы, без сервисных, и не свои
         pyrogram.handlers.MessageHandler(discussion_tap, filters.chat(LINKED_DISCUSSION_ID) & ~filters.service)
     )
     app.add_handler(
@@ -325,16 +328,15 @@ async def bind_discussion_handlers():
 async def discussion_poll_loop():
     """
     Резервный поллер обсуждения:
-    - Читает новые сообщения из связанной группы (LINKED_DISCUSSION_ID)
-    - Логирует каждое входящее
-    - По вероятности REPLY_PROBABILITY генерит ответ через Gemini
-    - Поддерживает FloodWait и сохраняет offset в meta(last_disc_msg_id)
+    - читает новые сообщения из LINKED_DISCUSSION_ID
+    - логирует только непустые
+    - по вероятности REPLY_PROBABILITY отвечает
+    - всегда двигает оффсет (чтобы не зацикливаться)
     """
     if not LINKED_DISCUSSION_ID:
         print("⚠️ [POLL] LINKED_DISCUSSION_ID не задан — поллер выключен")
         return
 
-    # стартовый оффсет
     last_id = int(get_meta("last_disc_msg_id", "0") or 0)
     if last_id == 0:
         async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=1):
@@ -350,49 +352,33 @@ async def discussion_poll_loop():
                     break
                 batch.append(m)
 
-            # от старых к новым
             for m in reversed(batch):
-                # базовый лог
-                dbg_reply(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} "
-                          f"text={_short((m.text or m.caption or ''), 200)}")
+                txt = (m.text or m.caption or "").strip()
+                if txt:
+                    dbg_reply(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} text={_short(txt, 200)}")
 
                 # не отвечаем на себя
-                if m.from_user and m.from_user.is_self:
-                    continue
+                if not (m.from_user and m.from_user.is_self) and txt:
+                    rnd = random.random()
+                    if rnd <= REPLY_PROBABILITY:
+                        dbg_reply(f"💬 [POLL] generating for msg_id={m.id}: {_short(txt, 200)}")
+                        reply_text = await build_reply_for_comment(txt)
+                        dbg_reply(f"💬 [POLL] ready -> {_short(html.unescape(reply_text), 200)}")
+                        try:
+                            sent = await app.send_message(
+                                chat_id=m.chat.id,
+                                text=reply_text,
+                                reply_to_message_id=m.id,
+                                parse_mode=ParseMode.HTML
+                            )
+                            dbg_reply(f"✅ [POLL] sent reply_id={sent.id}")
+                        except FloodWait as e:
+                            dbg_reply(f"⏳ [POLL] FloodWait {e.value}s on send; sleeping")
+                            await asyncio.sleep(e.value + 1)
+                        except RPCError as e:
+                            dbg_reply(f"❌ [POLL] send failed: {e}")
 
-                text = (m.text or m.caption or "").strip()
-                if not text:
-                    continue
-
-                # вероятность ответа
-                rnd = random.random()
-                if rnd > REPLY_PROBABILITY:
-                    dbg_reply(f"⏭️ [POLL] skip by probability rnd={rnd:.2f} > p={REPLY_PROBABILITY}")
-                    last_id = max(last_id, m.id)
-                    set_meta("last_disc_msg_id", str(last_id))
-                    continue
-
-                # генерация ответа
-                dbg_reply(f"💬 [POLL] generating for msg_id={m.id}: {_short(text, 200)}")
-                reply_text = await build_reply_for_comment(text)
-                dbg_reply(f"💬 [POLL] ready -> {_short(html.unescape(reply_text), 200)}")
-
-                # отправка
-                try:
-                    sent = await app.send_message(
-                        chat_id=m.chat.id,
-                        text=reply_text,
-                        reply_to_message_id=m.id,
-                        parse_mode=ParseMode.HTML
-                    )
-                    dbg_reply(f"✅ [POLL] sent reply_id={sent.id} to chat={sent.chat.id}")
-                except FloodWait as e:
-                    dbg_reply(f"⏳ [POLL] FloodWait {e.value}s on send; sleeping")
-                    await asyncio.sleep(e.value + 1)
-                except RPCError as e:
-                    dbg_reply(f"❌ [POLL] send failed: {e}")
-
-                # сдвигаем оффсет
+                # ВСЕГДА сдвигаем оффсет
                 last_id = max(last_id, m.id)
                 set_meta("last_disc_msg_id", str(last_id))
 
@@ -402,7 +388,6 @@ async def discussion_poll_loop():
         except Exception as e:
             dbg_reply(f"[discussion_poll] error: {e}")
 
-        # частота опроса
         await asyncio.sleep(3)
 
 # ---------- вотчер канала: комментит каждый N-й ----------
@@ -560,17 +545,21 @@ if __name__ == "__main__":
                 print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
 
         LINKED_DISCUSSION_ID = linked_id
-        await bind_discussion_handlers()  # повесить хендлеры на конкретную группу
+        await bind_discussion_handlers()  # вешаем хендлеры на конкретную группу
         return LINKED_DISCUSSION_ID
 
     async def main():
         try:
             await app.start()
             await resolve_linked_discussion()
+
+            # фоновые задачи
             asyncio.create_task(scheduler_loop())
             asyncio.create_task(comment_watcher_loop())
-            # резерв на случай, если апдейты в обсуждении не приходят
-            asyncio.create_task(discussion_poll_loop())
+            if ENABLE_DISCUSSION_POLLER:
+                # включай только если апдейты из обсуждения реально не приходят
+                asyncio.create_task(discussion_poll_loop())
+
             await idle()
         except (Unauthorized, AuthKeyUnregistered) as e:
             print(f"❌ Ошибка авторизации: {e}")
