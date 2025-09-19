@@ -525,60 +525,103 @@ async def random_cmd(_, msg: Message):
             mark_seen(uid)
         await msg.reply_text("Ок, отправил (refresh).")
 
+@app.on_message(filters.me & filters.command("test_discussion", prefixes=[".", "/"]))
+async def test_discussion_cmd(_, msg: Message):
+    """Тестирует обработку комментариев"""
+    info = []
+    info.append(f"🎯 TARGET_CHAT_ID: {TARGET_CHAT_ID}")
+    info.append(f"💬 LINKED_DISCUSSION_ID: {LINKED_DISCUSSION_ID}")
+    info.append(f"🎲 REPLY_PROBABILITY: {REPLY_PROBABILITY}")
+    info.append(f"🤖 Gemini client: {'✅' if client else '❌'}")
+    info.append(f"🔗 Handlers bound: {'✅' if _HANDLERS_BOUND else '❌'}")
+    
+    if LINKED_DISCUSSION_ID:
+        try:
+            # Проверяем доступ к группе
+            chat = await app.get_chat(LINKED_DISCUSSION_ID)
+            info.append(f"✅ Группа: {chat.title}")
+            
+            # Проверяем последние сообщения
+            count = 0
+            async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=5):
+                count += 1
+                if m.text or m.caption:
+                    info.append(f"📝 Msg {m.id}: {_short(m.text or m.caption or '', 50)}")
+            info.append(f"📊 Последних сообщений: {count}")
+            
+        except Exception as e:
+            info.append(f"❌ Ошибка доступа к группе: {e}")
+    else:
+        info.append("❌ Группа обсуждения не найдена")
+    
+    await msg.reply_text("\n".join(info))
+
+@app.on_message(filters.me & filters.command("rebind_handlers", prefixes=[".", "/"]))
+async def rebind_handlers_cmd(_, msg: Message):
+    """Принудительно перепривязывает обработчики"""
+    global _HANDLERS_BOUND
+    _HANDLERS_BOUND = False
+    
+    if LINKED_DISCUSSION_ID:
+        await bind_discussion_handlers()
+        await msg.reply_text(f"✅ Обработчики перепривязаны к {LINKED_DISCUSSION_ID}")
+    else:
+        await msg.reply_text("❌ LINKED_DISCUSSION_ID не установлен")        
+
 # ---------- запуск ----------
 if __name__ == "__main__":
     init_db()
     print("🚀 Starting userbot (interval repost + watcher comments + Gemini)…")
 
     async def resolve_linked_discussion(ensure_join: bool = True, test_read: bool = True) -> int | None:
-    """Ищем связанную группу обсуждений канала и (при необходимости) входим туда."""
-    global LINKED_DISCUSSION_ID
-    
-    try:
-        ch = await app.get_chat(TARGET_CHAT_ID)
-    except RPCError as e:
-        print(f"❌ Не смог получить канал {TARGET_CHAT_ID}: {e}")
-        LINKED_DISCUSSION_ID = None
-        return None
-
-    linked = getattr(ch, "linked_chat", None)
-    if not linked:
-        print("❌ У канала нет связанной группы (включи «Обсуждения»).")
-        LINKED_DISCUSSION_ID = None
-        return None
-
-    linked_id = linked.id
-    print(f"✅ Linked discussion ID: {linked_id}")
-
-    # ✅ СНАЧАЛА устанавливаем ID
-    LINKED_DISCUSSION_ID = linked_id
-
-    if ensure_join:
+        """Ищем связанную группу обсуждений канала и (при необходимости) входим туда."""
+        global LINKED_DISCUSSION_ID
+        
         try:
-            me = await app.get_chat_member(linked_id, "me")
-            status = getattr(me, "status", None)
-            print(f"👤 Мой статус в обсуждении: {status}")
-        except RPCError:
-            status = None
-        if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
-            try:
-                await app.join_chat(linked_id)
-                print("✅ Вступил в обсуждение")
-            except RPCError as e:
-                print(f"⚠️ Не смог вступить: {e}")
-
-    if test_read:
-        try:
-            async for _ in app.get_chat_history(linked_id, limit=1):
-                pass
-            print("📚 Историю обсуждения читаю ок")
+            ch = await app.get_chat(TARGET_CHAT_ID)
         except RPCError as e:
-            print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+            print(f"❌ Не смог получить канал {TARGET_CHAT_ID}: {e}")
+            LINKED_DISCUSSION_ID = None
+            return None
 
-    # ✅ ТЕПЕРЬ привязываем обработчики (когда ID уже установлен)
-    await bind_discussion_handlers()
-    
-    return LINKED_DISCUSSION_ID
+        linked = getattr(ch, "linked_chat", None)
+        if not linked:
+            print("❌ У канала нет связанной группы (включи «Обсуждения»).")
+            LINKED_DISCUSSION_ID = None
+            return None
+
+        linked_id = linked.id
+        print(f"✅ Linked discussion ID: {linked_id}")
+
+        # ✅ СНАЧАЛА устанавливаем ID
+        LINKED_DISCUSSION_ID = linked_id
+
+        if ensure_join:
+            try:
+                me = await app.get_chat_member(linked_id, "me")
+                status = getattr(me, "status", None)
+                print(f"👤 Мой статус в обсуждении: {status}")
+            except RPCError:
+                status = None
+            if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
+                try:
+                    await app.join_chat(linked_id)
+                    print("✅ Вступил в обсуждение")
+                except RPCError as e:
+                    print(f"⚠️ Не смог вступить: {e}")
+
+        if test_read:
+            try:
+                async for _ in app.get_chat_history(linked_id, limit=1):
+                    pass
+                print("📚 Историю обсуждения читаю ок")
+            except RPCError as e:
+                print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+
+        # ✅ ТЕПЕРЬ привязываем обработчики (когда ID уже установлен)
+        await bind_discussion_handlers()
+        
+        return LINKED_DISCUSSION_ID
 
     async def main():
         try:
