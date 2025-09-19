@@ -1,4 +1,3 @@
-# userbot_collect_clean.py
 import asyncio
 import sqlite3
 import random
@@ -10,12 +9,12 @@ import os
 import html
 
 from pyrogram import Client, filters, idle
-from pyrogram.handlers import MessageHandler
 from pyrogram.errors import FloodWait, FileReferenceExpired, RPCError, Unauthorized, AuthKeyUnregistered
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
+import pyrogram
 
-# ---------- Gemini: НОВЫЙ SDK (google-genai) ----------
+# ===== Gemini: новый SDK =====
 from google import genai
 from google.genai import types
 
@@ -29,14 +28,14 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 # >>> ИСТОЧНИКИ И ЦЕЛЬ <<<
 SOURCE_CHATS = [
-    -1001423363475, -1001304740791, -1001628148774, -1002092838245, -1001096054832, -1001334218632,
-    -1001431200947, -1001268741369, -1001647745905, -1001980097656, -1001544919663
+    -1001423363475, -1001304740791, -1001628148774, -1002092838245, -1001096054832,
+    -1001334218632, -1001431200947, -1001268741369, -1001647745905, -1001980097656, -1001544919663
 ]
 TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
 
 LINKED_DISCUSSION_ID = None
-REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "0.3"))  # 0..1 — как часто отвечать
+REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "0.3"))  # 0..1
 
 # >>> ЧАСТОТА <<<
 ENABLE_LIVE_STREAM = True
@@ -46,39 +45,24 @@ PER_CHAT_SCAN_LIMIT = 500
 # >>> КОММЕНТАРИИ <<<
 ENABLE_AUTO_COMMENTS = True
 COMMENT_EVERY_N = 10
-CHANNEL_POLL_SECONDS = 10   # как часто сканировать канал на новые посты
+CHANNEL_POLL_SECONDS = 10  # как часто сканировать канал на новые посты
 
-# ====== Gemini (новый клиент) ======
+# ===== Gemini =====
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-if client:
-    print("✅ Gemini API инициализирован (google-genai)")
+client: genai.Client | None = None
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)  # новый клиент
+        print("✅ Gemini (google-genai) инициализирован")
+    except Exception as e:
+        print(f"❌ Gemini init error: {e}")
 else:
     print("⚠️ GEMINI_API_KEY не найден (будет fallback)")
 
-# «расслабленные» safety; можно подкрутить под себя
-SAFETY_LOOSE = [
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-]
-
-# ====== антидубли и мета ======
-DATA_DIR = Path("./data"); DATA_DIR.mkdir(exist_ok=True)
+# ===== антидубли и мета =====
+DATA_DIR = Path("./data")
+DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "seen.db"
-
-_GEMINI_MUTE_UNTIL = 0
-def log_once(msg: str, cooldown_sec: int = 30):
-    global _GEMINI_MUTE_UNTIL
-    now = time.time()
-    if now >= _GEMINI_MUTE_UNTIL:
-        print(msg)
-        _GEMINI_MUTE_UNTIL = now + cooldown_sec
 
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -131,7 +115,7 @@ def set_meta(key: str, value: str):
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
         conn.commit()
 
-# ====== клиент userbot ======
+# ===== клиент userbot =====
 app = Client(
     name=SESSION_NAME,
     api_id=API_ID,
@@ -148,6 +132,14 @@ async def send_with_retry(func, *args, **kwargs):
             print(f"⏰ FloodWait: {e.value}s")
             await asyncio.sleep(e.value + 1)
 
+def _clamp_caption(text: str | None) -> str | None:
+    if not text:
+        return None
+    # лимит подписи к медиа — 1024 символа
+    if len(text) > 1024:
+        text = text[:1024]
+    return text
+
 def match_image(msg: Message) -> bool:
     return bool(
         msg and (
@@ -156,18 +148,8 @@ def match_image(msg: Message) -> bool:
         )
     )
 
-# --- лимит подписи к медиа 1024 символа (ограничение Telegram) ---
-# см. доки/сводку лимитов
-CAPTION_LIMIT = 1024  # базовый лимит подписей к медиа в Telegram :contentReference[oaicite:1]{index=1}
-
-def trim_caption(s: str | None, limit: int = CAPTION_LIMIT) -> str | None:
-    if not s:
-        return None
-    s = s.strip()
-    return s if len(s) <= limit else (s[:limit - 1] + "…")
-
 async def send_clean(app: Client, msg: Message, target_id: int | str) -> Message | None:
-    caption = trim_caption(msg.caption)
+    caption = _clamp_caption(msg.caption or None)
     if msg.photo:
         return await send_with_retry(
             app.send_photo, chat_id=target_id, photo=msg.photo.file_id,
@@ -180,88 +162,45 @@ async def send_clean(app: Client, msg: Message, target_id: int | str) -> Message
         )
     return None
 
-async def resolve_linked_discussion(ensure_join: bool = True, test_read: bool = True) -> int | None:
-    """
-    Находит связанную группу обсуждений для TARGET_CHAT_ID и (опционально) вступает в неё.
-    Сохраняет значение в глобальной переменной LINKED_DISCUSSION_ID и возвращает его.
-    """
-    global LINKED_DISCUSSION_ID
-    try:
-        ch = await app.get_chat(TARGET_CHAT_ID)
-    except RPCError as e:
-        print(f"❌ resolve_linked_discussion: не смог получить канал {TARGET_CHAT_ID}: {e}")
-        LINKED_DISCUSSION_ID = None
-        return None
-
-    linked = getattr(ch, "linked_chat", None)
-    if not linked:
-        print("❌ У канала нет связанной группы (включи «Обсуждения»).")
-        LINKED_DISCUSSION_ID = None
-        return None
-
-    linked_id = linked.id
-    print(f"✅ Linked discussion ID: {linked_id}")
-
-    if ensure_join:
-        try:
-            me = await app.get_chat_member(linked_id, "me")
-            status = getattr(me, "status", None)
-            print(f"👤 Мой статус в обсуждении: {status}")
-        except RPCError:
-            status = None
-
-        if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
-            try:
-                await app.join_chat(linked_id)
-                print("✅ Вступил в обсуждение")
-            except RPCError as e:
-                print(f"⚠️ Не смог вступить в обсуждение: {e}")
-
-    if test_read:
-        try:
-            async for _ in app.get_chat_history(linked_id, limit=1):
-                pass
-            print("📚 Историю обсуждения читаю ок")
-        except RPCError as e:
-            print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
-
-    LINKED_DISCUSSION_ID = linked_id
-    return LINKED_DISCUSSION_ID
-
-# ---------- Gemini: «кусок кода» как простой текст ----------
+# ---------- Gemini helpers ----------
 FALLBACK_SNIPPET = """<div>
   <button id="prev-button">Previous</button>
   <img id="carousel-image" src="" alt="Carousel Image">
   <button id="next-button">Next</button>
 </div>"""
 
-def _gen_wise_snippet_sync() -> str:
+def _gen_text_sync(prompt: str, max_tokens=200, temperature=0.8) -> str:
     if not client:
         return FALLBACK_SNIPPET
-    cfg = types.GenerateContentConfig(max_output_tokens=200, temperature=0.8)
-    prompt = ("Генерируйте мудрые мысли, как будто вы еврейский раввин, дающий совет о деньгах, женщинах, мойшах и жизни под солнцем")
     try:
         resp = client.models.generate_content(
             model="gemini-2.5-flash-lite",
-            contents=prompt,
-            config=cfg
+            contents=[types.Content(role="user", parts=[types.Part.from_text(prompt)])],
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=temperature
+            ),
         )
         return (resp.text or "").strip() or FALLBACK_SNIPPET
     except Exception as e:
-        log_once(f"[gemini] error: {e}")
-        return FALLBACK_SNIPPET
-
-async def gen_code_snippet() -> str:
-    try:
-        text = await asyncio.to_thread(_gen_wise_snippet_sync)
-        return (text or FALLBACK_SNIPPET)[:1000]
-    except Exception as e:
-        log_once(f"❌ gen_code_snippet error: {e}")
+        print(f"❌ Gemini error: {e}")
         return FALLBACK_SNIPPET
 
 async def build_random_code_comment() -> str:
-    raw = await gen_code_snippet()
-    return html.escape(raw)  # просто текст, без <pre><code>
+    txt = await asyncio.to_thread(_gen_text_sync, "Генерируйте мудрые мысли, как будто вы еврейский раввин, дающий совет о деньгах, женщинах, мойшах и жизни под солнцем")
+    return html.escape(txt)
+
+async def build_reply_for_comment(user_text: str) -> str:
+    if not user_text:
+        user_text = "."
+    prompt = (
+        "Ты пишешь короткие остроумные ответы (3–5 предложения) на русскоязычные комментарии. "
+        "Твои ответ должен быть анекдотом в стиле про евреев, но не оскорбительным. "
+        "Анекдот может быть в формате еврей, русский и немец (или две любых других национальность, но еврей должен быть и он самый мудрый и хитрый) сидят где-то (заходят куда-то)... "
+        "Формат: прямой ответ без преамбул и смайлов"
+    )
+    txt = await asyncio.to_thread(_gen_text_sync, prompt, max_tokens=80, temperature=0.9)
+    return html.escape(txt)[:1000] if txt else "Окей"
 
 # ---------- Комментирование поста канала ----------
 async def add_comment_to_post(target_msg: Message):
@@ -269,8 +208,7 @@ async def add_comment_to_post(target_msg: Message):
         return
     text = await build_random_code_comment()
     try:
-        # официальный способ «оставить комментарий»: взять discussion_message и ответить на него
-        discussion_msg = await app.get_discussion_message(target_msg.chat.id, target_msg.id)  # :contentReference[oaicite:2]{index=2}
+        discussion_msg = await app.get_discussion_message(target_msg.chat.id, target_msg.id)
         if not discussion_msg:
             print("❌ Нет обсуждения у поста — пропустил")
             return
@@ -279,217 +217,97 @@ async def add_comment_to_post(target_msg: Message):
     except RPCError as e:
         print(f"❌ Ошибка при комментировании: {e}")
 
-# ---------- Ответ на комментарий в обсуждении ----------
-async def build_reply_for_comment(user_text: str) -> str:
-    if not user_text:
-        user_text = "."
-    if not client:
-        return "Окей 🙂"
-
-    system_hint = (
-        "Ты пишешь короткие остроумные ответы (3–5 предложения) на русскоязычные комментарии. "
-        "Твои ответ должен быть анекдотом в стиле про евреев, но не оскорбительным. "
-        "Анекдот может быть в формате еврей, русский и немец (или две любых других национальность, но еврей должен быть и он самый мудрый и хитрый) сидят где-то (заходят куда-то)... "
-        "Формат: прямой ответ без преамбул и смайлов"
-    )
-
-    cfg = types.GenerateContentConfig(
-        max_output_tokens=80,
-        temperature=0.9,
-        top_p=0.95,
-        safety_settings=SAFETY_LOOSE,  # настройка safety через новый SDK :contentReference[oaicite:3]{index=3}
-    )
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[system_hint, f"Комментарий:\n{user_text}\n\nОтвет:"],
-            config=cfg
-        )
-        text = (resp.text or "").strip()
-        return html.escape(text)[:1000] if text else "Окей 🙂"
-    except Exception as e:
-        log_once(f"[gemini] error: {e}")
-        return "Окей 🙂"
-
-# ---------- LIVE-хендлер: поток из источников ----------
+# ---------- поток из источников ----------
 @app.on_message(filters.chat(EFFECTIVE_SOURCE_CHATS) & (filters.photo | filters.document))
 async def handler(_, msg: Message):
-    if not ENABLE_LIVE_STREAM:
+    if not ENABLE_LIVE_STREAM or not match_image(msg):
         return
-    if not match_image(msg):
-        return
-
-    uid = msg.photo.file_unique_id if msg.photo else (
-        msg.document.file_unique_id if msg.document else None
-    )
+    uid = msg.photo.file_unique_id if msg.photo else (msg.document.file_unique_id if msg.document else None)
     if uid and is_seen(uid):
-        print(f"⏭️ Дубликат: {uid}")
         return
-
     try:
         sent = await send_clean(app, msg, TARGET_CHAT_ID)
-        if uid: mark_seen(uid)
+        if uid:
+            mark_seen(uid)
         if sent:
             print(f"📤 Отправлено в цель: message_id={sent.id}")
     except FileReferenceExpired:
         fresh = await app.get_messages(msg.chat.id, msg.id)
         sent = await send_clean(app, fresh, TARGET_CHAT_ID)
-        if uid: mark_seen(uid)
+        if uid:
+            mark_seen(uid)
         print(f"📤 Отправлено (refreshed): message_id={sent.id if sent else 'None'}")
 
-# Лог всех сообщений обсуждения и автoответ
-@app.on_message(~filters.service & ~filters.me)
-async def on_discussion_message(_, msg: Message):
-    if msg.chat and LINKED_DISCUSSION_ID and msg.chat.id == LINKED_DISCUSSION_ID:
-        print(f"[DISCUSSION] id={msg.id} reply_to={msg.reply_to_message_id} "
-              f"text={(msg.text or msg.caption or '')[:80]}")
+# ---------- динамические хендлеры для обсуждения ----------
+_HANDLERS_BOUND = False
+async def bind_discussion_handlers():
+    global _HANDLERS_BOUND
+    if _HANDLERS_BOUND or not LINKED_DISCUSSION_ID:
+        return
 
-        text = (msg.text or msg.caption or "").strip()
-        if not text:
+    async def discussion_tap(_, m: Message):
+        print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} "
+              f"text={(m.text or m.caption or '')[:80]}")
+
+    async def discussion_autoreply(_, m: Message):
+        if m.from_user and m.from_user.is_self:
             return
-
+        txt = (m.text or m.caption or "").strip()
+        if not txt:
+            return
         if random.random() > REPLY_PROBABILITY:
             return
+        reply_text = await build_reply_for_comment(txt)
+        await app.send_message(
+            chat_id=m.chat.id,
+            text=reply_text,
+            reply_to_message_id=m.id,
+            parse_mode=ParseMode.HTML
+        )
 
-        reply_text = await build_reply_for_comment(text)
-        try:
-            await send_with_retry(
-                app.send_message,
-                chat_id=msg.chat.id,
-                text=reply_text,
-                reply_to_message_id=msg.id,
-                parse_mode=ParseMode.HTML
-            )
-            print(f"✅ Ответил на комментарий {msg.id}")
-        except RPCError as e:
-            print(f"❌ Не смог ответить: {e}")
+    app.add_handler(
+        # только сообщения из связанной группы, без сервисных, и не свои
+        pyrogram.handlers.MessageHandler(discussion_tap, filters.chat(LINKED_DISCUSSION_ID) & ~filters.service)
+    )
+    app.add_handler(
+        pyrogram.handlers.MessageHandler(discussion_autoreply, filters.chat(LINKED_DISCUSSION_ID) & ~filters.service & ~filters.me)
+    )
+    _HANDLERS_BOUND = True
+    print("🔗 Discussion handlers bound")
 
-# ---------- Выбор случайного кандидата из истории ----------
-async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True):
-    async def collect(chat, include_seen: bool):
-        out = []
-        async for m in app.get_chat_history(chat, limit=per_chat_limit):
-            if not match_image(m): continue
-            uid = m.photo.file_unique_id if m.photo else (
-                m.document.file_unique_id if (m.document and m.document.mime_type and m.document.mime_type.startswith("image/")) else None
-            )
-            if not uid: continue
-            if include_seen or not is_seen(uid):
-                out.append((m, uid))
-        return out
-
-    candidates = []
-    if prefer_unseen:
-        for c in sources: candidates += await collect(c, include_seen=False)
-        if not candidates:
-            for c in sources: candidates += await collect(c, include_seen=True)
-    else:
-        for c in sources: candidates += await collect(c, include_seen=True)
-
-    return random.choice(candidates) if candidates else (None, None)
-
-@app.on_message(filters.me & filters.command("test_comments", prefixes=[".", "/"]))
-async def test_comments_cmd(_, msg: Message):
-    """Тест связки канала и группы обсуждения."""
-    info = []
-    try:
-        chat = await app.get_chat(TARGET_CHAT_ID)
-        info.append(f"✅ Целевой канал: {chat.title} ({TARGET_CHAT_ID})")
-
-        linked = getattr(chat, "linked_chat", None)
-        if linked:
-            info.append(f"✅ Связанная группа: {linked.title} ({linked.id})")
-            try:
-                member = await app.get_chat_member(linked.id, "me")
-                info.append(f"✅ Статус в группе: {member.status}")
-            except Exception as e:
-                info.append(f"❌ Ошибка членства: {e}")
-
-            try:
-                count = 0
-                async for _ in app.get_chat_history(linked.id, limit=5):
-                    count += 1
-                info.append(f"✅ Последних сообщений в группе: {count}")
-            except Exception as e:
-                info.append(f"❌ Ошибка чтения группы: {e}")
-        else:
-            info.append("❌ Связанная группа не найдена")
-
-    except Exception as e:
-        info.append(f"❌ Ошибка получения канала: {e}")
-
-    info.append(f"LINKED_DISCUSSION_ID: {LINKED_DISCUSSION_ID}")
-    info.append(f"REPLY_PROBABILITY: {REPLY_PROBABILITY}")
-    info.append(f"Gemini client: {'✅' if client else '❌'}")
-    await msg.reply_text("\n".join(info))
-
-# ---------- Команда .random ----------
-@app.on_message(filters.me & filters.command("random", prefixes=[".", "/"]))
-async def random_cmd(_, msg: Message):
-    sources = [msg.command[1]] if len(msg.command) >= 2 else EFFECTIVE_SOURCE_CHATS.copy()
-    if not sources:
-        await msg.reply_text("EFFECTIVE_SOURCE_CHATS пуст.")
+# ---------- резервный опрос обсуждения ----------
+async def discussion_poll_loop():
+    if not LINKED_DISCUSSION_ID:
         return
-    m, uid = await pick_random_candidate(sources, per_chat_limit=PER_CHAT_SCAN_LIMIT, prefer_unseen=True)
-    if not m:
-        await msg.reply_text("Кандидатов не нашёл.")
-        return
-    try:
-        sent = await send_clean(app, m, TARGET_CHAT_ID)
-        if uid: mark_seen(uid)
-        await msg.reply_text("Ок, отправил случайный пост.")
-    except FileReferenceExpired:
-        fresh = await app.get_messages(m.chat.id, m.id)
-        sent = await send_clean(app, fresh, TARGET_CHAT_ID)
-        if uid: mark_seen(uid)
-        await msg.reply_text("Ок, отправил (refresh).")
-
-# ---------- Диагностика ----------
-@app.on_message(filters.me & filters.command("diag_comments", prefixes=[".", "/"]))
-async def diag_comments(_, msg: Message):
-    chat = await app.get_chat(TARGET_CHAT_ID)
-    info = [f"Target: {chat.id} ({chat.type})"]
-    linked = getattr(chat, "linked_chat", None)
-    if linked:
-        info.append(f"Linked discussion: {linked.id} ({linked.type})")
-        try:
-            me = await app.get_chat_member(linked.id, "me")
-            info.append(f"Membership in linked: {me.status}")
-        except RPCError as e:
-            info.append(f"get_chat_member error: {e}")
-    else:
-        info.append("No linked discussion group (comments disabled)")
-
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute("SELECT value FROM meta WHERE key='channel_posts_count'")
-        row = cur.fetchone()
-        count = int(row[0]) if row else 0
-    info.append(f"Current posts count: {count}")
-    info.append(f"Every N: {COMMENT_EVERY_N}; Auto: {'ON' if ENABLE_AUTO_COMMENTS else 'OFF'}")
-    await msg.reply_text("\n".join(info))
-
-# ---------- Планировщик постинга по интервалу ----------
-async def scheduler_loop():
-    await asyncio.sleep(5)
+    last_id = int(get_meta("last_disc_msg_id", "0") or 0)
+    if last_id == 0:
+        async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=1):
+            last_id = m.id
+            set_meta("last_disc_msg_id", str(last_id))
+            break
     while True:
         try:
-            if not EFFECTIVE_SOURCE_CHATS:
-                await asyncio.sleep(POST_EVERY_SECONDS); continue
-            m, uid = await pick_random_candidate(EFFECTIVE_SOURCE_CHATS, per_chat_limit=PER_CHAT_SCAN_LIMIT, prefer_unseen=True)
-            if m:
-                try:
-                    sent = await send_clean(app, m, TARGET_CHAT_ID)
-                except FileReferenceExpired:
-                    fresh = await app.get_messages(m.chat.id, m.id)
-                    sent = await send_clean(app, fresh, TARGET_CHAT_ID)
-                if uid: mark_seen(uid)
+            batch = []
+            async for m in app.get_chat_history(LINKED_DISCUSSION_ID, limit=50):
+                if m.id <= last_id:
+                    break
+                batch.append(m)
+            for m in reversed(batch):
+                # лог + автоответ, как в динамических хендлерах
+                print(f"[DISCUSSION] id={m.id} reply_to={m.reply_to_message_id} text={(m.text or m.caption or '')[:80]}")
+                if not (m.from_user and m.from_user.is_self):
+                    if (m.text or m.caption) and random.random() <= REPLY_PROBABILITY:
+                        reply_text = await build_reply_for_comment(m.text or m.caption)
+                        await app.send_message(m.chat.id, reply_text, reply_to_message_id=m.id, parse_mode=ParseMode.HTML)
+                last_id = max(last_id, m.id)
+                set_meta("last_disc_msg_id", str(last_id))
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
         except Exception as e:
-            print(f"[scheduler] error: {e}")
-        await asyncio.sleep(POST_EVERY_SECONDS)
+            print(f"[discussion_poll] error: {e}")
+        await asyncio.sleep(3)
 
-# ---------- Вотчер канала: комментит каждый N-й пост ----------
+# ---------- вотчер канала: комментит каждый N-й ----------
 async def comment_watcher_loop():
     await asyncio.sleep(5)
     last_scanned = int(get_meta("last_scanned_msg_id", "0") or 0)
@@ -498,7 +316,6 @@ async def comment_watcher_loop():
             last_scanned = m.id
             set_meta("last_scanned_msg_id", str(last_scanned))
             break
-
     while True:
         try:
             new_msgs = []
@@ -510,7 +327,6 @@ async def comment_watcher_loop():
                 if not (m.text or m.photo or m.document):
                     continue
                 new_msgs.append(m)
-
             for m in reversed(new_msgs):
                 cnt = incr_counter("channel_posts_count", 1)
                 print(f"📊 Новый пост #{cnt} id={m.id}")
@@ -518,60 +334,148 @@ async def comment_watcher_loop():
                     await add_comment_to_post(m)
                 last_scanned = max(last_scanned, m.id)
                 set_meta("last_scanned_msg_id", str(last_scanned))
-
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
         except Exception as e:
             print(f"[comment_watcher] error: {e}")
-
         await asyncio.sleep(CHANNEL_POLL_SECONDS)
 
-# ---------- Прочие утилиты ----------
-@app.on_message(filters.me & filters.command("id", prefixes=[".", "/"]))
-async def get_id_cmd(_, msg: Message):
-    if len(msg.command) < 2:
-        await msg.reply_text("Использование: .id @username_or_link"); return
-    target = msg.command[1]
+# ---------- планировщик постинга ----------
+async def scheduler_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if not EFFECTIVE_SOURCE_CHATS:
+                await asyncio.sleep(POST_EVERY_SECONDS)
+                continue
+            m, uid = await pick_random_candidate(EFFECTIVE_SOURCE_CHATS, per_chat_limit=PER_CHAT_SCAN_LIMIT, prefer_unseen=True)
+            if m:
+                try:
+                    await send_clean(app, m, TARGET_CHAT_ID)
+                except FileReferenceExpired:
+                    fresh = await app.get_messages(m.chat.id, m.id)
+                    await send_clean(app, fresh, TARGET_CHAT_ID)
+                if uid:
+                    mark_seen(uid)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:
+            print(f"[scheduler] error: {e}")
+        await asyncio.sleep(POST_EVERY_SECONDS)
+
+# ---------- выбор кандидата ----------
+async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True):
+    async def collect(chat, include_seen: bool):
+        out = []
+        async for m in app.get_chat_history(chat, limit=per_chat_limit):
+            if not match_image(m):
+                continue
+            uid = m.photo.file_unique_id if m.photo else (
+                m.document.file_unique_id if (m.document and m.document.mime_type and m.document.mime_type.startswith("image/")) else None
+            )
+            if not uid:
+                continue
+            if include_seen or not is_seen(uid):
+                out.append((m, uid))
+        return out
+
+    candidates = []
+    if prefer_unseen:
+        for c in sources:
+            candidates += await collect(c, include_seen=False)
+        if not candidates:
+            for c in sources:
+                candidates += await collect(c, include_seen=True)
+    else:
+        for c in sources:
+            candidates += await collect(c, include_seen=True)
+
+    return random.choice(candidates) if candidates else (None, None)
+
+# ---------- команды ----------
+@app.on_message(filters.me & filters.command("random", prefixes=[".", "/"]))
+async def random_cmd(_, msg: Message):
+    sources = [msg.command[1]] if len(msg.command) >= 2 else EFFECTIVE_SOURCE_CHATS.copy()
+    if not sources:
+        await msg.reply_text("EFFECTIVE_SOURCE_CHATS пуст.")
+        return
+    m, uid = await pick_random_candidate(sources, per_chat_limit=PER_CHAT_SCAN_LIMIT, prefer_unseen=True)
+    if not m:
+        await msg.reply_text("Кандидатов не нашёл.")
+        return
     try:
-        chat = await app.get_chat(target)
-        title = getattr(chat, "title", "") or ""
-        await msg.reply_text(f"ID: {chat.id}\nTitle: {title}")
-    except Exception as e:
-        await msg.reply_text(f"Ошибка: {e}")
+        await send_clean(app, m, TARGET_CHAT_ID)
+        if uid:
+            mark_seen(uid)
+        await msg.reply_text("Ок, отправил случайный пост.")
+    except FileReferenceExpired:
+        fresh = await app.get_messages(m.chat.id, m.id)
+        await send_clean(app, fresh, TARGET_CHAT_ID)
+        if uid:
+            mark_seen(uid)
+        await msg.reply_text("Ок, отправил (refresh).")
 
-@app.on_message(filters.me & filters.command("ping", prefixes=[".", "/"]))
-async def ping_cmd(_, msg: Message):
-    await msg.reply_text("pong")
-
-# ---------- Запуск ----------
+# ---------- запуск ----------
 if __name__ == "__main__":
     init_db()
     print("🚀 Starting userbot (interval repost + watcher comments + Gemini)…")
 
+    async def resolve_linked_discussion(ensure_join: bool = True, test_read: bool = True) -> int | None:
+        """Ищем связанную группу обсуждений канала и (при необходимости) входим туда."""
+        global LINKED_DISCUSSION_ID
+        try:
+            ch = await app.get_chat(TARGET_CHAT_ID)
+        except RPCError as e:
+            print(f"❌ Не смог получить канал {TARGET_CHAT_ID}: {e}")
+            LINKED_DISCUSSION_ID = None
+            return None
+
+        linked = getattr(ch, "linked_chat", None)
+        if not linked:
+            print("❌ У канала нет связанной группы (включи «Обсуждения»).")
+            LINKED_DISCUSSION_ID = None
+            return None
+
+        linked_id = linked.id
+        print(f"✅ Linked discussion ID: {linked_id}")
+
+        if ensure_join:
+            try:
+                me = await app.get_chat_member(linked_id, "me")
+                status = getattr(me, "status", None)
+                print(f"👤 Мой статус в обсуждении: {status}")
+            except RPCError:
+                status = None
+            if not status or str(status).endswith("LEFT") or str(status).endswith("KICKED"):
+                try:
+                    await app.join_chat(linked_id)
+                    print("✅ Вступил в обсуждение")
+                except RPCError as e:
+                    print(f"⚠️ Не смог вступить: {e}")
+
+        if test_read:
+            try:
+                async for _ in app.get_chat_history(linked_id, limit=1):
+                    pass
+                print("📚 Историю обсуждения читаю ок")
+            except RPCError as e:
+                print(f"⚠️ Не смог прочитать историю обсуждения: {e}")
+
+        LINKED_DISCUSSION_ID = linked_id
+        await bind_discussion_handlers()  # повесить хендлеры на конкретную группу
+        return LINKED_DISCUSSION_ID
+
     async def main():
         try:
-            print("🔄 Запускаем userbot...")
             await app.start()
             await resolve_linked_discussion()
-            print("✅ Userbot запущен")
-
-            try:
-                me = await app.get_me()
-                print(f"👤 Подключен как: {me.first_name} (@{me.username})")
-            except Exception as e:
-                print(f"⚠️ Не удалось получить информацию о себе: {e}")
-
             asyncio.create_task(scheduler_loop())
             asyncio.create_task(comment_watcher_loop())
-
-            print("🎯 Все системы запущены, бот готов к работе!")
+            # резерв на случай, если апдейты в обсуждении не приходят
+            asyncio.create_task(discussion_poll_loop())
             await idle()
-
         except (Unauthorized, AuthKeyUnregistered) as e:
             print(f"❌ Ошибка авторизации: {e}")
-            print("💡 Проверьте SESSION_STRING или удалите файл сессии")
-        except Exception as e:
-            print(f"❌ Критическая ошибка: {e}")
         finally:
             try:
                 await app.stop()
