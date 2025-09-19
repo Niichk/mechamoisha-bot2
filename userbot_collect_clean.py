@@ -162,10 +162,15 @@ async def resolve_linked_discussion():
         if linked:
             LINKED_DISCUSSION_ID = linked.id
             print(f"✅ Linked discussion ID: {LINKED_DISCUSSION_ID}")
+            return LINKED_DISCUSSION_ID
         else:
             print("⚠️ У канала нет связанной группы (включи Обсуждения)")
+            LINKED_DISCUSSION_ID = None
+            return None
     except Exception as e:
-        print(f"resolve_linked_discussion error: {e}")
+        print(f"❌ resolve_linked_discussion error: {e}")
+        LINKED_DISCUSSION_ID = None
+        return None
 
 # ---------- Gemini: генерация кусочка «кода» как простого текста ----------
 FALLBACK_SNIPPET = """<div>
@@ -299,33 +304,34 @@ async def handler(_, msg: Message):
         print(f"📤 Отправлено (refreshed): message_id={sent.id if sent else 'None'}")
 
 
-@app.on_message(~filters.service)
+@app.on_message(~filters.service & ~filters.me)
 async def on_discussion_message(_, msg: Message):
-    # ждём, пока получим id связанной группы
-    if not LINKED_DISCUSSION_ID:
+    # Диагностика всех сообщений
+    if msg.chat and msg.chat.id == LINKED_DISCUSSION_ID:
+        print(f"[DISCUSSION] got id={msg.id} reply_to={msg.reply_to_message_id} "
+              f"thread={getattr(msg,'message_thread_id',None)} "
+              f"text={(msg.text or msg.caption or '')[:60]}")
+    
+    # Проверяем, что это связанная группа
+    if not LINKED_DISCUSSION_ID or not msg.chat or msg.chat.id != LINKED_DISCUSSION_ID:
         return
 
-    # не зацикливаться на своих же ответах
-    if msg.from_user and msg.from_user.is_self:
-        return
-
-    # реагируем только в связанной группе
-    if not msg.chat or msg.chat.id != LINKED_DISCUSSION_ID:
-        return
-
-    # текст комментария (или подпись к фото/доку)
+    # Получаем текст комментария
     text = msg.text or msg.caption or ""
     if not text.strip():
+        print("⏭️ Пустой комментарий, пропускаем")
         return
 
-    # (опционально) не отвечать на КАЖДОЕ сообщение
+    # Проверяем вероятность ответа
     import random
     if random.random() > REPLY_PROBABILITY:
+        print(f"⏭️ Пропускаем ответ (вероятность {REPLY_PROBABILITY})")
         return
 
+    print(f"💬 Генерируем ответ на: {text[:50]}...")
     reply_text = await build_reply_for_comment(text)
 
-    # Отвечаем прямо на комментарий в том же треде
+    # Отвечаем на комментарий
     try:
         await send_with_retry(
             app.send_message,
@@ -334,19 +340,9 @@ async def on_discussion_message(_, msg: Message):
             reply_to_message_id=msg.id,
             parse_mode=ParseMode.HTML
         )
-        print(f"💬 Ответил на комментарий {msg.id}")
+        print(f"✅ Ответил на комментарий {msg.id}")
     except RPCError as e:
         print(f"❌ Не смог ответить: {e}")
-        
-
-@app.on_message(~filters.service)
-async def _tap(_, m: Message):
-    if not LINKED_DISCUSSION_ID or not m.chat: 
-        return
-    if m.chat.id == LINKED_DISCUSSION_ID:
-        print(f"[DISCUSSION] got id={m.id} reply_to={m.reply_to_message_id} "
-              f"thread={getattr(m,'message_thread_id',None)} "
-              f"text={(m.text or m.caption or '')[:60]}")
 
 # ---------- Выбор случайного кандидата из истории ----------
 async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True):
@@ -371,6 +367,50 @@ async def pick_random_candidate(sources, per_chat_limit=500, prefer_unseen=True)
         for c in sources: candidates += await collect(c, include_seen=True)
 
     return random.choice(candidates) if candidates else (None, None)
+
+@app.on_message(filters.me & filters.command("test_comments", prefixes=[".", "/"]))
+async def test_comments_cmd(_, msg: Message):
+    """Тестирует работу с комментариями"""
+    info = []
+    
+    # Проверяем целевой канал
+    try:
+        chat = await app.get_chat(TARGET_CHAT_ID)
+        info.append(f"✅ Целевой канал: {chat.title} ({TARGET_CHAT_ID})")
+        
+        linked = getattr(chat, "linked_chat", None)
+        if linked:
+            info.append(f"✅ Связанная группа: {linked.title} ({linked.id})")
+            
+            # Проверяем членство
+            try:
+                member = await app.get_chat_member(linked.id, "me")
+                info.append(f"✅ Статус в группе: {member.status}")
+            except Exception as e:
+                info.append(f"❌ Ошибка членства: {e}")
+                
+            # Проверяем последние сообщения в группе
+            try:
+                count = 0
+                async for m in app.get_chat_history(linked.id, limit=5):
+                    count += 1
+                info.append(f"✅ Последних сообщений в группе: {count}")
+            except Exception as e:
+                info.append(f"❌ Ошибка чтения группы: {e}")
+                
+        else:
+            info.append("❌ Связанная группа не найдена")
+            
+    except Exception as e:
+        info.append(f"❌ Ошибка получения канала: {e}")
+    
+    # Состояние переменных
+    info.append(f"LINKED_DISCUSSION_ID: {LINKED_DISCUSSION_ID}")
+    info.append(f"REPLY_PROBABILITY: {REPLY_PROBABILITY}")
+    info.append(f"Gemini: {'✅' if gemini_model else '❌'}")
+    
+    await msg.reply_text("\n".join(info))
+
 
 # ---------- Команда .random ----------
 @app.on_message(filters.me & filters.command("random", prefixes=[".", "/"]))
@@ -506,11 +546,50 @@ if __name__ == "__main__":
     print("🚀 Starting userbot (interval repost + watcher comments + Gemini)…")
 
     async def main():
-        await app.start()
-        await resolve_linked_discussion()   # <-- ВАЖНО: сразу после старта
-        asyncio.create_task(scheduler_loop())
-        asyncio.create_task(comment_watcher_loop())
-        await idle()
-        await app.stop()
+        try:
+            print("🔄 Запускаем userbot...")
+            await app.start()
+            print("✅ Userbot запущен")
+            
+            # Получаем информацию о себе
+            try:
+                me = await app.get_me()
+                print(f"👤 Подключен как: {me.first_name} (@{me.username})")
+            except Exception as e:
+                print(f"⚠️ Не удалось получить информацию о себе: {e}")
+            
+            # Проверяем связанную группу
+            discussion_id = await resolve_linked_discussion()
+            if discussion_id:
+                print(f"✅ Найдена связанная группа: {discussion_id}")
+                
+                # Проверяем членство в группе
+                try:
+                    member = await app.get_chat_member(discussion_id, "me")
+                    print(f"✅ Статус в группе: {member.status}")
+                except Exception as e:
+                    print(f"❌ Не состою в группе обсуждений: {e}")
+                    print("💡 Нужно вступить в группу для ответов на комментарии")
+            else:
+                print("❌ Связанная группа не найдена")
+                print("💡 Включите обсуждения в настройках канала")
+            
+            # Запускаем фоновые задачи
+            asyncio.create_task(scheduler_loop())
+            asyncio.create_task(comment_watcher_loop())
+            
+            print("🎯 Все системы запущены, бот готов к работе!")
+            await idle()
+            
+        except (Unauthorized, AuthKeyUnregistered) as e:
+            print(f"❌ Ошибка авторизации: {e}")
+            print("💡 Проверьте SESSION_STRING или удалите файл сессии")
+        except Exception as e:
+            print(f"❌ Критическая ошибка: {e}")
+        finally:
+            try:
+                await app.stop()
+            except:
+                pass
 
     asyncio.run(main())
