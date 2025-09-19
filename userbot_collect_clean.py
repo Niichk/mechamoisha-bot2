@@ -306,12 +306,11 @@ async def bind_discussion_handlers():
         if random.random() > REPLY_PROBABILITY:
             return
         reply_text = await build_reply_for_comment(txt)
-        try:
-            await app.send_message(
+        await app.send_message(
                 chat_id=m.chat.id,
-                text=reply_text,
+                text=reply_text,                  # тут уже html.escape(...)
                 reply_to_message_id=m.id,
-                parse_mode=ParseMode.HTML
+                disable_web_page_preview=True     # опционально
             )
         except RPCError as e:
             print(f"❌ [REPLY] send failed: {e}")
@@ -380,7 +379,6 @@ async def discussion_poll_loop():
                                 chat_id=m.chat.id,
                                 text=reply_text,
                                 reply_to_message_id=m.id,
-                                parse_mode=ParseMode.HTML
                             )
                             dbg_reply(f"✅ [POLL] sent reply_id={sent.id}")
                         except FloodWait as e:
