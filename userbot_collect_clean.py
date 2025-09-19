@@ -160,6 +160,11 @@ async def send_with_retry(func, *args, **kwargs):
             print(f"⏰ FloodWait: {e.value}s")
             await asyncio.sleep(e.value + 1)
 
+def _clamp_caption(text: str | None) -> str | None:
+    if not text:
+        return None
+    # лимит подписи к медиа — 1024 символа
+    return text[:1024] if len(text) > 1024 else text
 
 def match_image(msg: Message) -> bool:
     return bool(
@@ -241,7 +246,7 @@ async def build_reply_for_comment(user_text: str) -> str:
     dbg_gemini(f"[REPLY] build for: {_short(user_text, 200)}")
     txt = await asyncio.to_thread(_gen_text_sync, prompt, max_tokens=80, temperature=0.9)
     dbg_gemini(f"[REPLY] built: {_short(txt, 200)}")
-    return html.escape(txt)[:1000] if txt else "Окей."
+    return html.escape(txt) if txt else "Окей."
 
 # ---------- Комментирование поста канала ----------
 async def add_comment_to_post(target_msg: Message):
