@@ -63,7 +63,7 @@ TARGET_CHAT_ID = -1001676356290
 EFFECTIVE_SOURCE_CHATS = [c for c in SOURCE_CHATS if c != TARGET_CHAT_ID]
 
 LINKED_DISCUSSION_ID = None
-REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "0.2"))  # 0..1
+REPLY_PROBABILITY = float(os.getenv("REPLY_PROBABILITY", "0.05"))  # 0..1
 
 # >>> ЧАСТОТА <<<
 ENABLE_LIVE_STREAM = True
@@ -200,7 +200,7 @@ def _gen_text_sync(prompt: str, max_tokens=200, temperature=0.8) -> str:
         dbg_gemini(f"[GEMINI] ⇢ prompt: {_short(prompt)}")
         # В новом SDK достаточно передать СТРОКУ
         resp = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash-lite-preview-09-2025",
             contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=max_tokens,
@@ -228,7 +228,7 @@ async def build_random_code_comment() -> str:
     txt = await asyncio.to_thread(
         _gen_text_sync,
         # Ты просил не убирать стиль — оставляю нейтральную «мудрость»; это комментарии под постами.
-        "Генерируйте короткие (3-5 предложений) мудрости, как будто вы еврейский раввин, дающий совет о деньгах или женщинах или мойшах или жизни под солнцем"
+        "Генерируйте короткие (НЕ БОЛЕЕ 3-5 предложений!) мудрости, как будто вы еврейский раввин, дающий совет о деньгах или женщинах или мойшах или жизни под солнцем"
     )
     return html.escape(txt)
 
